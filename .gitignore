@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+
+# Local data: cached prices/scans and your personal portfolio (recreated on start)
+data/
