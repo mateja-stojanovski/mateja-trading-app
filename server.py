@@ -3,7 +3,15 @@ Investing Opportunities - local app server.
 Run:  python server.py     (then open http://localhost:8765)
 
 Standard library only - nothing to install.
+
+Optional environment variables (for hosting online, e.g. on Render):
+  PORT           port to listen on (default 8765); setting it also listens on all interfaces
+  APP_PASSWORD   password for the "My money" tab (any username works)
+  SUPABASE_URL   + SUPABASE_KEY: store "My money" holdings in Supabase instead of data/my_portfolio.json
+  NO_BROWSER=1   don't open a browser on start (never opens one when PORT is set)
 """
+import base64
+import hmac
 import html
 import json
 import math
@@ -21,7 +29,11 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 from universe import ALIASES, BUCKET_LABEL, BY_TICKER, HISA_RATE, RESEARCH, UNIVERSE
 
-PORT = 8765
+PORT = int(os.environ.get("PORT", 8765))
+HOST = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(ROOT, "data")
 CACHE = os.path.join(DATA, "cache")
@@ -703,7 +715,22 @@ def check_portfolio(items):
 MY_PATH = os.path.join(DATA, "my_portfolio.json")
 
 
+def supabase(method, path, body=None):
+    """Call the Supabase REST API for the `holdings` table (rows: id text, data jsonb)."""
+    req = urllib.request.Request(
+        f"{SUPABASE_URL}/rest/v1/holdings{path}", method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"apikey": SUPABASE_KEY, "Authorization": f"Bearer {SUPABASE_KEY}",
+                 "Content-Type": "application/json", "Prefer": "return=minimal"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read()
+    return json.loads(raw) if raw else None
+
+
 def load_my():
+    if SUPABASE_URL:
+        rows = supabase("GET", "?select=data&order=created_at")
+        return {"holdings": [r["data"] for r in rows]}
     if os.path.exists(MY_PATH):
         with open(MY_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -713,6 +740,22 @@ def load_my():
 def save_my(d):
     with open(MY_PATH, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2)
+
+
+def add_my(h):
+    if SUPABASE_URL:
+        return supabase("POST", "", {"id": h["id"], "data": h})
+    d = load_my()
+    d["holdings"].append(h)
+    save_my(d)
+
+
+def delete_my(i):
+    if SUPABASE_URL:
+        return supabase("DELETE", "?id=eq." + urllib.parse.quote(i))
+    d = load_my()
+    d["holdings"] = [h for h in d["holdings"] if h["id"] != i]
+    save_my(d)
 
 
 def fx_to_aud(ccy):
@@ -795,6 +838,27 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def authorised(self):
+        """"My money" is personal, so when APP_PASSWORD is set it needs the password (browser login box)."""
+        if not APP_PASSWORD:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                pw = base64.b64decode(auth[6:]).decode().partition(":")[2]
+            except Exception:
+                pw = ""
+            if hmac.compare_digest(pw.encode(), APP_PASSWORD.encode()):
+                return True
+        body = json.dumps({"error": "Password needed for My money."}).encode()
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="My money"')
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+        return False
+
     def body(self):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
@@ -813,6 +877,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(make_plan(float(q.get("amount", 5000)), q.get("profile", "balanced"),
                                                 q.get("simple") == "1", float(q.get("monthly", 0))))
             if p.path == "/api/my":
+                if not self.authorised():
+                    return
                 return self.send_json(my_value())
             if p.path == "/api/history":
                 sym, _ = resolve(q["t"])
@@ -829,23 +895,20 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"started": True})
             if p.path == "/api/check":
                 return self.send_json(check_portfolio(self.body()["items"]))
+            if p.path.startswith("/api/my/") and not self.authorised():
+                return
             if p.path == "/api/my/add":
                 h = self.body()
-                d = load_my()
                 h["id"] = str(int(time.time() * 1000))
                 if h["ticker"] != "HISA":
                     h["ticker"] = h["ticker"].upper().strip()
                     sym, _ = resolve(h["ticker"])
                     if not sym:
                         return self.send_json({"error": f"Couldn't find {h['ticker']}"}, 400)
-                d["holdings"].append(h)
-                save_my(d)
+                add_my(h)
                 return self.send_json({"ok": True})
             if p.path == "/api/my/delete":
-                i = self.body()["id"]
-                d = load_my()
-                d["holdings"] = [h for h in d["holdings"] if h["id"] != i]
-                save_my(d)
+                delete_my(self.body()["id"])
                 return self.send_json({"ok": True})
         except Exception as e:
             return self.send_json({"error": str(e)}, 500)
@@ -853,12 +916,12 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv = ThreadingHTTPServer((HOST, PORT), Handler)
     url = f"http://localhost:{PORT}"
     print(f"\n  Investing Opportunities is running at {url}\n  (close this window or press Ctrl+C to stop)\n")
     if not load_sentiment():
         threading.Thread(target=run_scan, daemon=True).start()
-    if os.environ.get("NO_BROWSER") != "1":
+    if os.environ.get("NO_BROWSER") != "1" and "PORT" not in os.environ:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:
         srv.serve_forever()
