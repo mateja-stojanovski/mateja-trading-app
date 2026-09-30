@@ -13,13 +13,13 @@ Optional environment variables (for hosting online, e.g. on Render):
 import base64
 import hmac
 import html
+import http.cookiejar
 import json
-import math
 import os
 import re
-import statistics
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -27,7 +27,8 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
-from universe import ALIASES, BUCKET_LABEL, BY_TICKER, HISA_RATE, RESEARCH, UNIVERSE
+import models
+from universe import ALIASES, BUCKET_LABEL, BY_TICKER, HISA_RATE, KIND_LABEL, RESEARCH, UNIVERSE
 
 PORT = int(os.environ.get("PORT", 8765))
 HOST = "0.0.0.0" if "PORT" in os.environ else "127.0.0.1"
@@ -98,8 +99,100 @@ def yahoo_search(q):
     return cached(f"search_{q.lower()}", 7 * 86400, go)
 
 
+# Yahoo's company data needs a session cookie and a "crumb" token that goes with it
+_YOPEN = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+_CRUMB = {"v": None, "t": 0.0}
+_CRUMB_LOCK = threading.Lock()
+
+
+def _yget(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-AU,en;q=0.9"})
+    with _YOPEN.open(req, timeout=20) as r:
+        return r.read()
+
+
+def yahoo_crumb(force=False):
+    with _CRUMB_LOCK:
+        if force or not _CRUMB["v"] or time.time() - _CRUMB["t"] > 6 * 3600:
+            try:
+                _yget("https://fc.yahoo.com")   # answers 404 but sets the session cookie
+            except Exception:
+                pass
+            _CRUMB.update(v=_yget("https://query1.finance.yahoo.com/v1/test/getcrumb").decode(), t=time.time())
+        return _CRUMB["v"]
+
+
+def yahoo_fundamentals(symbol):
+    """Valuation, profitability, growth, debt and analyst views for a company; size and yield for a fund."""
+    def go():
+        for attempt in (0, 1):
+            crumb = yahoo_crumb(force=attempt == 1)
+            url = (f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{urllib.parse.quote(symbol)}"
+                   f"?modules=summaryDetail,defaultKeyStatistics,financialData,price&crumb={urllib.parse.quote(crumb)}")
+            try:
+                res = json.loads(_yget(url))["quoteSummary"]["result"][0]
+                break
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403) and attempt == 0:
+                    continue
+                if e.code == 404:
+                    return {}
+                raise
+
+        def raw(mod, key):
+            v = (res.get(mod) or {}).get(key)
+            return v.get("raw") if isinstance(v, dict) else None
+        price = raw("financialData", "currentPrice") or raw("price", "regularMarketPrice")
+        target = raw("financialData", "targetMeanPrice")
+        return {
+            "pe": raw("summaryDetail", "trailingPE"),
+            "forward_pe": raw("summaryDetail", "forwardPE") or raw("defaultKeyStatistics", "forwardPE"),
+            "pb": raw("defaultKeyStatistics", "priceToBook"),
+            "div_yield": raw("summaryDetail", "dividendYield") or raw("summaryDetail", "yield"),
+            "roe": raw("financialData", "returnOnEquity"),
+            "margin": raw("financialData", "profitMargins"),
+            "rev_growth": raw("financialData", "revenueGrowth"),
+            "earn_growth": raw("financialData", "earningsGrowth"),
+            "debt_equity": raw("financialData", "debtToEquity"),
+            "target": target,
+            "target_upside": (target / price - 1) if target and price else None,
+            "rec_mean": raw("financialData", "recommendationMean"),
+            "rec_key": (res.get("financialData") or {}).get("recommendationKey"),
+            "analysts": raw("financialData", "numberOfAnalystOpinions"),
+            "market_cap": raw("price", "marketCap"),
+            "total_assets": raw("summaryDetail", "totalAssets") or raw("defaultKeyStatistics", "totalAssets"),
+            "beta": raw("summaryDetail", "beta") or raw("defaultKeyStatistics", "beta3Year"),
+        }
+    return cached(f"fund_{symbol}", 24 * 3600, go)
+
+
+def coingecko_data():
+    """Market cap, rank and distance from the all-time high for the coins in the list."""
+    ids = [u["coingecko"] for u in UNIVERSE if u.get("coingecko")]
+    def go():
+        url = ("https://api.coingecko.com/api/v3/coins/markets?vs_currency=aud&ids=" + ",".join(ids))
+        return {c["id"]: {"mcap_rank": c.get("market_cap_rank"), "market_cap": c.get("market_cap"),
+                          "ath_change": (c.get("ath_change_percentage") or 0) / 100,
+                          "volume": c.get("total_volume")} for c in json.loads(fetch(url))}
+    try:
+        return cached("coingecko_markets", 6 * 3600, go)
+    except Exception:
+        return {}
+
+
+def fear_greed():
+    """The crypto Fear & Greed index (0 = extreme fear, 100 = extreme greed)."""
+    def go():
+        d = json.loads(fetch("https://api.alternative.me/fng/?limit=1"))["data"][0]
+        return {"value": int(d["value"]), "label": d["value_classification"]}
+    try:
+        return cached("fear_greed", 6 * 3600, go)
+    except Exception:
+        return None
+
+
 def metrics(monthly):
-    """Performance stats from a monthly adjusted-close series (includes dividends)."""
+    """Simple performance stats from a monthly adjusted-close series (includes dividends)."""
     a = monthly["adj"]
     out = {"years": round(len(a) / 12, 1)}
     if len(a) < 3:
@@ -114,47 +207,35 @@ def metrics(monthly):
     out["cagr3"] = cagr(36)
     out["cagr5"] = cagr(60)
     out["cagr10"] = cagr(119)
-    full = (a[-1] / a[0]) ** (12 / (len(a) - 1)) - 1
-    out["cagr_all"] = full
-    rets = [math.log(a[i] / a[i - 1]) for i in range(max(1, len(a) - 60), len(a))]
-    out["vol"] = statistics.pstdev(rets) * math.sqrt(12) if len(rets) > 2 else None
+    out["cagr_all"] = (a[-1] / a[0]) ** (12 / (len(a) - 1)) - 1
     peak, mdd = a[0], 0.0
     for v in a:
         peak = max(peak, v)
         mdd = min(mdd, v / peak - 1)
     out["mdd"] = mdd
-    # share of 12-month windows that finished higher - "how often does it go up"
     wins = [a[i] > a[i - 12] for i in range(12, len(a))]
     out["up_years_pct"] = sum(wins) / len(wins) if wins else None
     return out
 
 
-def perf_score(m):
-    """0-100: risk-adjusted long-term return."""
-    g = m.get("cagr5") if m.get("cagr5") is not None else m.get("cagr_all")
-    vol = m.get("vol")
-    if g is None or not vol:
-        return 50
-    g = min(g, 0.12)                            # don't reward chasing a hot streak
-    sharpe = (g - HISA_RATE * 0.8) / max(vol, 0.03)
-    s = 50 + sharpe * 45
-    s -= max(0, -m.get("mdd", 0) - 0.35) * 60   # extra penalty for brutal crashes
-    trust = min(1, m.get("years", 0) / 7)       # short history = less trust
-    s = trust * s + (1 - trust) * 60
-    return max(0, min(100, s))
-
-
 # --------------------------------------------------------------------------- sentiment
-POS = ["buy", "bought", "buying", "hold", "holding", "solid", "great", "good", "love", "recommend",
-       "set and forget", "set-and-forget", "low fee", "low fees", "cheap", "diversified", "diversification",
-       "long term", "long-term", "compounding", "happy", "winner", "outperform", "strong", "boring",
-       "safe", "simple", "easy", "no brainer", "bullish", "growth", "up", "gains", "record high", "rally",
-       "beat", "upgrade", "surge", "soar", "jump", "rise", "rises", "rising", "top pick", "best"]
-NEG = ["sell", "sold", "selling", "avoid", "overvalued", "expensive", "crash", "crashed", "bubble", "scam",
-       "risky", "risk", "loss", "losses", "lost", "regret", "dump", "dumped", "bearish", "worst", "bad",
-       "terrible", "high fee", "high fees", "overlap", "concentrated", "concentration", "down", "fall",
-       "falls", "falling", "plunge", "slump", "tumble", "drop", "drops", "downgrade", "warn", "warning",
-       "fear", "worried", "nervous", "underperform", "hype", "fomo", "gamble", "gambling", "rug"]
+# General words plus finance words in the spirit of the Loughran-McDonald finance sentiment lists
+POS = {"buy", "bought", "buying", "hold", "holding", "solid", "great", "good", "love", "recommend", "low", "cheap",
+       "diversified", "diversification", "compounding", "happy", "winner", "outperform", "outperformed", "strong",
+       "boring", "safe", "simple", "easy", "bullish", "bull", "growth", "gains", "gain", "rally", "beat", "beats",
+       "upgrade", "upgraded", "surge", "surges", "soar", "soars", "jump", "jumps", "rise", "rises", "rising", "best",
+       "profit", "profitable", "record", "improve", "improved", "exceed", "exceeded", "undervalued", "accumulate",
+       "moon", "breakout", "higher", "recovery", "rebound"}
+NEG = {"sell", "sold", "selling", "avoid", "overvalued", "expensive", "crash", "crashed", "bubble", "scam", "risky",
+       "loss", "losses", "lost", "regret", "dump", "dumped", "bearish", "bear", "worst", "bad", "terrible", "overlap",
+       "concentrated", "concentration", "down", "fall", "falls", "falling", "plunge", "plunges", "slump", "tumble",
+       "drop", "drops", "downgrade", "downgraded", "warn", "warning", "warns", "fear", "worried", "nervous",
+       "underperform", "underperformed", "hype", "fomo", "gamble", "gambling", "rug", "weak", "weaker", "decline",
+       "declines", "lawsuit", "fraud", "investigation", "impairment", "bankrupt", "bankruptcy", "default", "writedown",
+       "miss", "missed", "cut", "cuts", "layoffs", "lower", "sinks", "slides"}
+POS_PHRASES = ["set and forget", "set-and-forget", "low fee", "low fees", "long term", "long-term", "no brainer",
+               "record high", "top pick", "all time high"]
+NEG_PHRASES = ["high fee", "high fees", "rug pull", "sell off", "sell-off", "profit warning"]
 NEGATORS = {"not", "no", "never", "don't", "dont", "isn't", "wasn't", "won't", "without"}
 THEMES = {
     "set-and-forget": ["set and forget", "set-and-forget", "chill"],
@@ -166,18 +247,36 @@ THEMES = {
     "crash/volatility fears": ["crash", "volatil", "bubble", "correction"],
     "hype/speculation": ["moon", "hype", "fomo", "yolo", "gamble", "tendies"],
     "overlap": ["overlap"],
+    "interest rates": ["rate hike", "rate cut", "interest rate", "rba"],
 }
 
-SUBS = "fiaustralia+AusFinance+ASX_Bets+ausstocks"
+AU_SUBS = "fiaustralia+AusFinance+ASX_Bets+ausstocks+ASX"
+CRYPTO_SUBS = "CryptoCurrency+Bitcoin+ethereum+solana+XRP"
 REDDIT_FEEDS = [
-    ("r/fiaustralia (top this month)", "https://www.reddit.com/r/fiaustralia/top/.rss?t=month&limit=100"),
-    ("r/fiaustralia (newest)", "https://www.reddit.com/r/fiaustralia/new/.rss?limit=100"),
+    ("r/fiaustralia (top this month)", "https://www.reddit.com/r/fiaustralia/top/.rss?t=month&limit=100", "au"),
+    ("r/fiaustralia (newest)", "https://www.reddit.com/r/fiaustralia/new/.rss?limit=100", "au"),
     ("r/AusFinance (investing, top month)",
-     "https://www.reddit.com/r/AusFinance/search.rss?q=ETF+OR+shares+OR+invest&restrict_sr=1&sort=top&t=month"),
-    ("r/ASX_Bets (top this month)", "https://www.reddit.com/r/ASX_Bets/top/.rss?t=month&limit=100"),
-    ("r/ausstocks (top this month)", "https://www.reddit.com/r/ausstocks/top/.rss?t=month&limit=100"),
+     "https://www.reddit.com/r/AusFinance/search.rss?q=ETF+OR+shares+OR+invest&restrict_sr=1&sort=top&t=month", "au"),
+    ("r/ASX_Bets (top this month)", "https://www.reddit.com/r/ASX_Bets/top/.rss?t=month&limit=100", "au"),
+    ("r/ausstocks (top this month)", "https://www.reddit.com/r/ausstocks/top/.rss?t=month&limit=100", "au"),
+    ("r/ASX (top this month)", "https://www.reddit.com/r/ASX/top/.rss?t=month&limit=100", "au"),
+    ("r/CryptoCurrency (top this week)", "https://www.reddit.com/r/CryptoCurrency/top/.rss?t=week&limit=100", "crypto"),
+    ("r/Bitcoin (top this week)", "https://www.reddit.com/r/Bitcoin/top/.rss?t=week&limit=100", "crypto"),
+    ("r/ethereum (top this month)", "https://www.reddit.com/r/ethereum/top/.rss?t=month&limit=100", "crypto"),
 ]
+# where people talk that the app can't read, and why
+UNREADABLE = [
+    ("X / Twitter", "needs a paid API or a login; the free mirrors are shut down or blocked."),
+    ("Facebook groups", "need a login and are private."),
+    ("HotCopper", "blocks automated readers (Cloudflare)."),
+]
+CONTEXT_RE = re.compile(r"\b(asx|etf|etfs|shares?|stocks?|invest\w*|dividends?|portfolio|market|price|buy|buying|"
+                        r"sell|selling|bull\w*|bear\w*|hodl|crypto|super|brokerage)\b|\$", re.I)
+TICKER_STOP = {"ASX", "ETF", "ETFS", "USD", "AUD", "CEO", "IPO", "EPS", "YTD", "ATH", "FOMO", "HODL", "NYSE", "SPY",
+               "USA", "GDP", "RBA", "CPI", "NFT", "DCA", "FIRE", "LOL", "IMO", "TLDR", "EDIT", "HISA", "CGT", "ATO",
+               "SMSF", "AFSL", "ASIC", "GST", "ETH", "BTC", "SOL", "XRP"}
 
+ASX_WORD = re.compile(r"(?<![$\w])ASX(?![\w])")
 TAG_RE = re.compile(r"<[^>]+>")
 WORD_RE = re.compile(r"[a-z][a-z'\-/]*")
 
@@ -196,10 +295,8 @@ def text_sentiment(text):
             neg, pos = (neg + 1, pos) if negated else (neg, pos + 1)
         elif w in NEG:
             neg, pos = (neg, pos + 1) if negated else (neg + 1, pos)
-    for phrase in [p for p in POS if " " in p]:
-        pos += t.count(phrase)
-    for phrase in [p for p in NEG if " " in p]:
-        neg += t.count(phrase)
+    pos += sum(t.count(p) for p in POS_PHRASES)
+    neg += sum(t.count(p) for p in NEG_PHRASES)
     return pos, neg
 
 
@@ -209,7 +306,7 @@ def parse_atom(raw, source):
     for e in ET.fromstring(raw).findall("a:entry", ns):
         link = e.find("a:link", ns)
         out.append({
-            "source": source,
+            "source": source, "platform": "Reddit",
             "title": clean(e.findtext("a:title", "", ns)),
             "body": clean(e.findtext("a:content", "", ns))[:3000],
             "url": link.get("href") if link is not None else "",
@@ -222,7 +319,7 @@ def parse_rss(raw, source):
     out = []
     for it in ET.fromstring(raw).iter("item"):
         out.append({
-            "source": source,
+            "source": source, "platform": "News",
             "title": clean(it.findtext("title", "")),
             "body": clean(it.findtext("description", ""))[:600],
             "url": it.findtext("link", ""),
@@ -231,15 +328,57 @@ def parse_rss(raw, source):
     return out
 
 
-def mention_patterns(ticker, name=""):
-    pats = [re.compile(r"(?<![A-Za-z0-9])\$?" + re.escape(ticker) + r"(?![A-Za-z0-9])")]  # case-sensitive
-    for a in ALIASES.get(ticker, []):
+def bluesky_search(q, days=90):
+    """Recent English posts on Bluesky (where much of finance Twitter moved) matching q."""
+    url = ("https://api.bsky.app/xrpc/app.bsky.feed.searchPosts?limit=60&sort=latest&lang=en&q="
+           + urllib.parse.quote(q))
+    cutoff = time.strftime("%Y-%m-%d", time.gmtime(time.time() - days * 86400))
+    out = []
+    for p in json.loads(fetch(url)).get("posts", []):
+        rec = p.get("record") or {}
+        date = (rec.get("createdAt") or "")[:10]
+        if date < cutoff:
+            continue
+        text = clean(rec.get("text", ""))
+        handle = (p.get("author") or {}).get("handle", "")
+        out.append({"source": "Bluesky", "platform": "Bluesky", "title": text[:180], "body": text,
+                    "url": f"https://bsky.app/profile/{handle}/post/{p.get('uri', '').rsplit('/', 1)[-1]}", "date": date})
+    return out
+
+
+def stocktwits_stream(symbol):
+    """The latest StockTwits messages for a symbol. Many carry the poster's own Bullish / Bearish label."""
+    j = json.loads(fetch(f"https://api.stocktwits.com/api/2/streams/symbol/{urllib.parse.quote(symbol)}.json"))
+    out = []
+    for m in j.get("messages", []):
+        label = ((m.get("entities") or {}).get("sentiment") or {}).get("basic")
+        user = (m.get("user") or {}).get("username", "")
+        out.append({"source": "StockTwits", "platform": "StockTwits", "title": clean(m.get("body", ""))[:180],
+                    "body": clean(m.get("body", "")), "label": label, "date": (m.get("created_at") or "")[:10],
+                    "url": f"https://stocktwits.com/{user}/message/{m.get('id')}"})
+    return out
+
+
+def mention_patterns(u):
+    t = u["ticker"]
+    pats = []
+    if not (u.get("kind") == "crypto" and t == "SOL"):     # SOL is also Soul Patts on the ASX
+        pats.append(re.compile(r"(?<![A-Za-z0-9])\$?" + re.escape(t) + r"(?![A-Za-z0-9])"))  # case-sensitive
+    for a in ALIASES.get(t, []):
         pats.append(re.compile(r"\b" + re.escape(a) + r"\b", re.I))
     return pats
 
 
 def mentions(text, pats):
     return any(p.search(text) for p in pats)
+
+
+def bluesky_query(u):
+    if u["kind"] == "etf":
+        return f"{u['ticker']} ETF"
+    if u["kind"] == "crypto":
+        return u["name"]
+    return re.sub(r"\s+(Group|Limited|Global|Energy)$", "", u["name"])
 
 
 SCAN = {"running": False, "progress": "", "done": 0, "total": 0}
@@ -253,64 +392,132 @@ def load_sentiment():
     return None
 
 
+REDDIT_LIMITED = {"n": 0}   # rate-limited requests in a row during this scan
+
+
 def reddit_get(url):
-    for attempt in range(3):
+    """Reddit rate-limits hard. Retry once; after 3 refusals in a row, skip Reddit for the rest of the scan
+    instead of making the scan take half an hour."""
+    if REDDIT_LIMITED["n"] >= 3:
+        raise RuntimeError("skipped: Reddit is rate-limiting, try again later")
+    for attempt in range(2):
         try:
-            return fetch(url)
+            got = fetch(url)
+            REDDIT_LIMITED["n"] = 0
+            return got
         except urllib.error.HTTPError as e:
-            if e.code == 429 and attempt < 2:
-                time.sleep(15 + attempt * 15)
-                continue
+            if e.code == 429:
+                REDDIT_LIMITED["n"] += 1
+                if attempt == 0 and REDDIT_LIMITED["n"] < 3:
+                    time.sleep(20)
+                    continue
             raise
 
 
+def carry_over_reddit(results, prev):
+    """Reddit couldn't be read at all this time: keep each investment's Reddit numbers from the previous scan."""
+    for t, s in results.items():
+        old = (prev.get("tickers") or {}).get(t)
+        if not old:
+            continue
+        r = (old.get("by_source") or {}).get("Reddit") or {"n": old.get("reddit_mentions", 0), "pos": old.get("reddit_pos", 0),
+                                                           "neg": old.get("reddit_neg", 0), "opinions": 0}
+        s["by_source"]["Reddit"] = r
+        s["reddit_mentions"], s["reddit_pos"], s["reddit_neg"] = r["n"], r["pos"], r["neg"]
+        s["samples"] = [p for p in old.get("samples", []) if p.get("source") not in ("Bluesky", "StockTwits")][:5] + s["samples"]
+        s["themes"] = s["themes"] or old.get("themes", [])
+
+
 def run_scan():
-    """Scan Reddit + Google News, attribute posts to tickers, score sentiment. ~2 minutes."""
+    """Scan Reddit, Bluesky, StockTwits and Google News, attribute posts to investments, score the mood,
+    and note tickers people mention that the app doesn't track. About 3-4 minutes."""
     if SCAN["running"]:
         return
     SCAN.update(running=True, done=0, progress="Starting...")
+    REDDIT_LIMITED["n"] = 0
     try:
-        sources, posts = [], []
-        tickers = [u for u in UNIVERSE]
-        # one Reddit search per group of tickers (Reddit rate-limits hard, so keep requests few)
-        terms = [u["ticker"] if u["bucket"] != "spec" else u["name"] for u in tickers]
-        groups = [terms[i:i + 6] for i in range(0, len(terms), 6)]
-        SCAN["total"] = len(REDDIT_FEEDS) + len(groups) + len(tickers)
+        sources, au_posts, crypto_posts = [], [], []
+        tickers = list(UNIVERSE)
+        au_terms = [u["ticker"] for u in tickers if u["kind"] != "crypto"]
+        au_groups = [au_terms[i:i + 6] for i in range(0, len(au_terms), 6)]
+        crypto_terms = [u["name"] for u in tickers if u["kind"] == "crypto"]
+        st_list = [u for u in tickers if u.get("stocktwits")]
+        SCAN["total"] = len(REDDIT_FEEDS) + len(au_groups) + 1 + len(tickers) + 1 + len(st_list) + len(tickers)
 
-        for label, url in REDDIT_FEEDS:
+        # ---- Reddit: the feeds, then searches for the tickers (Reddit rate-limits hard, so few requests)
+        for label, url, group in REDDIT_FEEDS:
             SCAN["progress"] = f"Reading {label}"
             try:
                 got = parse_atom(reddit_get(url), label)
-                posts += got
-                sources.append({"name": label, "ok": True, "items": len(got)})
+                (au_posts if group == "au" else crypto_posts).extend(got)
+                sources.append({"name": label, "platform": "Reddit", "ok": True, "items": len(got)})
             except Exception as e:
-                sources.append({"name": label, "ok": False, "error": str(e)[:80]})
+                sources.append({"name": label, "platform": "Reddit", "ok": False, "error": str(e)[:80]})
             SCAN["done"] += 1
             time.sleep(5)
-
-        searched = []
-        ok = fail = 0
-        for g in groups:
-            SCAN["progress"] = "Searching Reddit for " + ", ".join(g)
-            q = " OR ".join(g)
-            url = (f"https://www.reddit.com/r/{SUBS}/search.rss?q={urllib.parse.quote(q)}"
+        searched_au, searched_crypto, ok, fail = [], [], 0, 0
+        for subs, terms, bucket in [(AU_SUBS, g, searched_au) for g in au_groups] + [(CRYPTO_SUBS, crypto_terms, searched_crypto)]:
+            SCAN["progress"] = "Searching Reddit for " + ", ".join(terms)
+            url = (f"https://www.reddit.com/r/{subs}/search.rss?q={urllib.parse.quote(' OR '.join(terms))}"
                    f"&restrict_sr=1&sort=relevance&t=year&limit=100")
             try:
-                searched += parse_atom(reddit_get(url), "Reddit search")
+                bucket.extend(parse_atom(reddit_get(url), "Reddit search"))
                 ok += 1
             except Exception:
                 fail += 1
             SCAN["done"] += 1
             time.sleep(5)
-        sources.append({"name": "Reddit ticker search (4 AU subs, past year)", "ok": ok > 0,
-                        "items": len(searched),
+        sources.append({"name": "Reddit ticker searches (AU + crypto subs, past year)", "platform": "Reddit", "ok": ok > 0,
+                        "items": len(searched_au) + len(searched_crypto),
                         "error": f"{fail} searches rate-limited" if fail else None})
 
+        # ---- Bluesky: one search per investment, kept only when it's about investing
+        SCAN["progress"] = "Searching Bluesky"
+        bsky, bsky_ok = {}, 0
+        def get_bsky(u):
+            try:
+                pats = mention_patterns(u)
+                return u["ticker"], [p for p in bluesky_search(bluesky_query(u))
+                                     if mentions(p["body"], pats) and CONTEXT_RE.search(p["body"])]
+            except Exception:
+                return u["ticker"], None
+        with ThreadPoolExecutor(4) as ex:
+            for t, items in ex.map(get_bsky, tickers):
+                bsky[t] = items or []
+                bsky_ok += items is not None
+                SCAN["done"] += 1
+        try:
+            # "$ASX" is also a US-listed chip maker, and ticker-spam bots list dozens of cashtags: skip both
+            bsky_asx = [p for p in bluesky_search("ASX") if CONTEXT_RE.search(p["body"]) and ASX_WORD.search(p["body"])
+                        and len(re.findall(r"\$[A-Z]{2,5}", p["body"])) <= 4]
+        except Exception:
+            bsky_asx = []
+        SCAN["done"] += 1
+        sources.append({"name": "Bluesky (posts about each investment + #ASX, last 90 days)", "platform": "Bluesky",
+                        "ok": bsky_ok > 0, "items": sum(len(v) for v in bsky.values()) + len(bsky_asx)})
+
+        # ---- StockTwits: crypto and US-listed shares (it doesn't cover the ASX)
+        st = {}
+        for u in st_list:
+            SCAN["progress"] = f"Reading StockTwits {u['stocktwits']}"
+            try:
+                st[u["ticker"]] = stocktwits_stream(u["stocktwits"])
+            except Exception:
+                st[u["ticker"]] = []
+            SCAN["done"] += 1
+            time.sleep(1)
+        sources.append({"name": "StockTwits (" + ", ".join(u["stocktwits"] for u in st_list) + ")", "platform": "StockTwits",
+                        "ok": any(st.values()), "items": sum(len(v) for v in st.values())})
+
+        # ---- Google News
         news = {}
         def get_news(u):
-            q = f'"{u["ticker"]}" ASX' if u["bucket"] not in ("spec",) else u["name"] + " price"
-            if u["bucket"] in ("core", "au", "global", "defensive", "satellite"):
+            if u["kind"] == "etf":
                 q = f'{u["ticker"]} ETF'
+            elif u["kind"] == "crypto":
+                q = u["name"] + " price"
+            else:
+                q = f'"{u["ticker"]}" ASX'
             url = ("https://news.google.com/rss/search?hl=en-AU&gl=AU&ceid=AU:en&q="
                    + urllib.parse.quote(q + " when:60d"))
             try:
@@ -322,40 +529,59 @@ def run_scan():
             for t, items in ex.map(get_news, tickers):
                 news[t] = items
                 SCAN["done"] += 1
-        sources.append({"name": "Google News (AU, last 60 days)", "ok": True,
+        sources.append({"name": "Google News (AU, last 60 days)", "platform": "News", "ok": True,
                         "items": sum(len(v) for v in news.values())})
 
         # ---- attribute + score
         results = {}
         for u in tickers:
-            t = u["ticker"]
-            pats = mention_patterns(t, u["name"])
+            t, pats = u["ticker"], mention_patterns(u)
+            pool = crypto_posts + searched_crypto + au_posts if u["kind"] == "crypto" else au_posts + searched_au
             seen, items = set(), []
-            for p in posts + searched:
-                txt = p["title"] + " " + p["body"]
-                if p["url"] in seen or not mentions(txt, pats):
+            for p in pool:
+                if p["url"] in seen or not mentions(p["title"] + " " + p["body"], pats):
                     continue
                 seen.add(p["url"])
                 items.append(p)
             news_items = [n for n in news.get(t, []) if n["url"] not in seen]
-            results[t] = summarise(items, news_items)
+            results[t] = summarise(items, news_items, bsky.get(t, []), st.get(t, []))
 
-        # tickers people talk about that we don't track
-        other = {}
-        for p in posts:
-            for m in re.findall(r"(?:ASX:\s?|\$)([A-Z]{3,4})\b", p["title"] + " " + p["body"]):
-                if m not in BY_TICKER:
+        prev = load_sentiment() or {}
+        reddit_read = any(s["ok"] for s in sources if s.get("platform") == "Reddit")
+        if not reddit_read and prev.get("tickers"):
+            carry_over_reddit(results, prev)
+            sources.append({"name": f"Reddit mentions carried over from the scan on {prev.get('fetched_at')}", "platform": "Reddit",
+                            "ok": True, "items": sum(r["reddit_mentions"] for r in results.values())})
+            au_posts = [dict(p, body="") for p in prev.get("recent_posts", [])]
+
+        # tickers people talk about that the app doesn't track (Australian posts only: $SOL there is Soul Patts)
+        other, where = {}, {}
+        for p in au_posts + searched_au + bsky_asx:
+            txt = p["title"] + " " + p["body"]
+            for m in set(re.findall(r"(?:ASX:\s?|\$)([A-Z]{3,4})\b", txt)):
+                if m not in BY_TICKER and m not in TICKER_STOP:
                     other[m] = other.get(m, 0) + 1
-        trending = sorted(other.items(), key=lambda x: -x[1])[:15]
+                    where.setdefault(m, []).append({k: p[k] for k in ("source", "title", "url", "date")})
+        if not reddit_read:
+            for t, n in prev.get("trending_other", []):
+                other[t] = other.get(t, 0) + n
+                where.setdefault(t, []).extend(prev.get("trending_samples", {}).get(t, []))
+        trending = sorted(other.items(), key=lambda x: -x[1])[:20]
 
-        themes_all = theme_counts(posts)
+        everything = au_posts + crypto_posts
         data = {"fetched_at": time.strftime("%Y-%m-%d %H:%M"), "sources": sources,
-                "posts_scanned": len(posts) + len(searched),
+                "unreadable": UNREADABLE,
+                "posts_scanned": len(everything) + len(searched_au) + len(searched_crypto)
+                                 + sum(len(v) for v in bsky.values()) + len(bsky_asx) + sum(len(v) for v in st.values()),
                 "headlines_scanned": sum(len(v) for v in news.values()),
-                "tickers": results, "trending_other": trending, "themes": themes_all,
-                "recent_posts": [{k: p[k] for k in ("source", "title", "url", "date")} for p in posts[:40]]}
+                "tickers": results, "trending_other": trending,
+                "trending_samples": {t: where[t][:3] for t, _ in trending},
+                "themes": theme_counts(everything + bsky_asx),
+                "recent_posts": [{k: p[k] for k in ("source", "title", "url", "date")}
+                                 for p in (au_posts[:25] + bsky_asx[:10] + crypto_posts[:10])]}
         with open(SENT_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f)
+        _ASSETS_MEMO.clear()
         SCAN["progress"] = "Done"
     except Exception as e:
         SCAN["progress"] = f"Scan failed: {e}"
@@ -373,90 +599,187 @@ def theme_counts(items):
     return sorted(counts.items(), key=lambda x: -x[1])
 
 
-def summarise(reddit_items, news_items):
+def summarise(reddit_items, news_items, bsky_items=(), st_items=()):
     def agg(items):
         pos = neg = opin = 0
         for p in items:
+            if p.get("label") in ("Bullish", "Bearish"):     # StockTwits: the poster labelled it
+                opin += 1
+                pos += p["label"] == "Bullish"
+                neg += p["label"] == "Bearish"
+                continue
             a, b = text_sentiment(p["title"] + " " + p["body"])
             if a or b:
                 opin += 1
                 pos += a > b
                 neg += b > a
-        return pos, neg, opin
-    rp, rn, ro = agg(reddit_items)
-    np_, nn, no = agg(news_items)
+        return {"n": len(items), "pos": pos, "neg": neg, "opinions": opin}
+    by = {"Reddit": agg(reddit_items), "Bluesky": agg(bsky_items), "StockTwits": agg(st_items), "News": agg(news_items)}
+    social = list(reddit_items[:5]) + list(bsky_items[:3]) + list(st_items[:3])
     return {
-        "reddit_mentions": len(reddit_items), "reddit_pos": rp, "reddit_neg": rn,
-        "news_count": len(news_items), "news_pos": np_, "news_neg": nn,
-        "themes": theme_counts(reddit_items)[:4],
-        "samples": [{k: p[k] for k in ("source", "title", "url", "date")} for p in reddit_items[:6]],
+        "reddit_mentions": by["Reddit"]["n"], "reddit_pos": by["Reddit"]["pos"], "reddit_neg": by["Reddit"]["neg"],
+        "news_count": by["News"]["n"], "news_pos": by["News"]["pos"], "news_neg": by["News"]["neg"],
+        "by_source": by,
+        "themes": theme_counts(list(reddit_items) + list(bsky_items))[:4],
+        "samples": [{k: p.get(k) for k in ("source", "title", "url", "date", "label")} for p in social],
         "headlines": [{k: p[k] for k in ("title", "url", "date")} for p in news_items[:5]],
     }
 
 
+# how much each platform can move the mood score away from the researched baseline, and how many posts it
+# takes to count fully (StockTwits posters label their own posts, so those are the most reliable)
+SOURCE_WEIGHT = {"Reddit": (0.35, 25), "Bluesky": (0.12, 20), "StockTwits": (0.18, 30), "News": (0.15, 20)}
+
+
 def sentiment_score(u, s):
-    """Blend researched baseline with live social + news data (0-100)."""
+    """Blend the researched baseline with live social + news data (0-100)."""
     base = u.get("baseline", 50)
     if not s:
         return base, 0.0
-    def ratio(p, n):
-        return (p + 1) / (p + n + 2)  # smoothed share positive
-    r_live = 100 * ratio(s["reddit_pos"], s["reddit_neg"])
-    n_live = 100 * ratio(s["news_pos"], s["news_neg"])
-    wr = min(s["reddit_mentions"] / 25, 1) * 0.45
-    wn = min(s["news_count"] / 20, 1) * 0.15
-    score = base * (1 - wr - wn) + r_live * wr + n_live * wn
-    return score, wr + wn
+    by = s.get("by_source") or {"Reddit": {"n": s["reddit_mentions"], "pos": s["reddit_pos"], "neg": s["reddit_neg"]},
+                                "News": {"n": s["news_count"], "pos": s["news_pos"], "neg": s["news_neg"]}}
+    acc = wsum = 0.0
+    for src, (w, full) in SOURCE_WEIGHT.items():
+        d = by.get(src)
+        if not d or not d["n"]:
+            continue
+        ww = w * min(d["n"] / full, 1)
+        acc += ww * 100 * (d["pos"] + 1) / (d["pos"] + d["neg"] + 2)   # smoothed share positive
+        wsum += ww
+    return base * (1 - wsum) + acc, wsum
 
 
 # --------------------------------------------------------------------------- opportunities
-def build_asset(u, sent):
+DECISIONS = [(72, "Strong buy & hold", "great"), (62, "Good buy", "good"), (52, "OK as a small slice", "ok"),
+             (42, "Wait and watch", "wait"), (0, "Avoid for now", "avoid")]
+SIZE_HINT = {
+    "core": "Can be your whole portfolio on its own.",
+    "au": "Can be a big part of a portfolio, alongside a global fund.",
+    "global": "Can be a big part of a portfolio, alongside an Australian fund.",
+    "defensive": "For cautious or short-term money. Low growth.",
+    "satellite": "Keep it to a small slice, about 10-20%.",
+    "found": "Not researched: keep it small and read up on it first.",
+    "stock": "Keep any one company to about 5-10% of your money.",
+    "spec": "Keep all crypto together under about 5% of your money.",
+}
+
+
+def decision(score):
+    for cut, label, tone in DECISIONS:
+        if score >= cut:
+            return {"label": label, "tone": tone}
+
+
+def agreement(model_score, crowd_score, researched):
+    if not researched:
+        return {"text": "Not in the research, so the models and the live scan decide.", "dir": "none"}
+    d = model_score - crowd_score
+    if d >= 10:
+        return {"text": "The models are more positive than the research and the crowd.", "dir": "up"}
+    if d <= -10:
+        return {"text": "The models are more negative than the research and the crowd.", "dir": "down"}
+    return {"text": "The models agree with the research and the crowd.", "dir": "same"}
+
+
+def benchmarks():
+    try:
+        return models.benchmark_returns(yahoo_chart("VAS.AX", "10y", "1mo"), yahoo_chart("IVV.AX", "10y", "1mo"))
+    except Exception:
+        return {"au": {}, "us": {}}
+
+
+def no_data(u, reason, name=None):
+    return {"ticker": u["ticker"], "name": name or u["name"], "kind": u.get("kind"), "no_data": True,
+            "reason": reason, "discovered": u.get("discovered", False), "mentions": u.get("mentions"),
+            "samples": u.get("samples", [])}
+
+
+def build_asset(u, sent, bench, extras):
     try:
         m = yahoo_chart(u["yahoo"], "10y", "1mo")
+    except Exception:
+        return no_data(u, "No price data found for this code on Yahoo Finance.")
+    kind = u.get("kind") or {"ETF": "etf", "EQUITY": "stock", "CRYPTOCURRENCY": "crypto"}.get((m.get("type") or "").upper())
+    name = m["name"] if u.get("discovered") else u["name"]
+    if not kind:
+        return no_data(u, "Not a share, fund or coin the models can handle.", name)
+    try:
         d = yahoo_chart(u["yahoo"], "1y", "1d")
-    except Exception as e:
-        return {**u, "error": str(e)}
-    met = metrics(m)
-    daily = d["close"]
-    s = (sent or {}).get("tickers", {}).get(u["ticker"])
+    except Exception:
+        d = {"close": [], "price": None}
+    f = {}
+    if kind in ("stock", "etf"):
+        try:
+            f = yahoo_fundamentals(u["yahoo"]) or {}
+        except Exception:
+            f = {}
+    elif kind == "crypto":
+        f = extras["cg"].get(u.get("coingecko"), {})
+    a = models.analyse(m, bench, kind, f, {"fee": u.get("fee"), "holdings": u.get("holdings")})
+    if not a["enough"]:
+        return no_data(u, a["reason"], name)
+    bucket = u.get("bucket") or ("found" if kind != "crypto" else "spec")
+    researched = u.get("researched", True)
+    s = u.get("_sent") or (sent or {}).get("tickers", {}).get(u["ticker"])
     ss, live_w = sentiment_score(u, s)
-    ps = perf_score(met)
-    fee_pen = min(u["fee"] * 25, 15)
-    score = 0.40 * u["quality"] + 0.30 * ps + 0.30 * ss - fee_pen * 0.3
-    if u["bucket"] == "spec":
-        score = min(score, 35)
-    elif u["bucket"] == "stock":
-        score = min(score, 60)
+    crowd = 0.5 * u["quality"] + 0.5 * ss if researched else ss
+    final = 0.6 * a["score"] + 0.4 * crowd if researched else 0.75 * a["score"] + 0.25 * ss
+    pos, neg = models.reasons(a, kind)
+    daily = d["close"]
+    final = round(final)
+    dec = decision(final)
     return {
-        **u, "bucket_label": BUCKET_LABEL[u["bucket"]],
+        **{k: v for k, v in u.items() if not k.startswith("_")},
+        "name": name, "kind": kind, "kind_label": KIND_LABEL[kind], "bucket": bucket,
+        "bucket_label": BUCKET_LABEL.get(bucket, bucket), "researched": researched,
         "price": d.get("price") or m.get("price"), "currency": m.get("currency"),
         "day_change": (daily[-1] / daily[-2] - 1) if len(daily) > 1 else None,
-        "spark": daily[-120:], "metrics": met,
-        "perf_score": round(ps), "sent_score": round(ss), "live_weight": round(live_w, 2),
-        "score": round(score), "verdict": verdict(u, score, met), "sentiment": s,
+        "spark": daily[::max(1, len(daily) // 120)] + daily[-1:] if daily else [],   # the past year, ~120 points
+        "metrics": metrics(m), "model": a, "fundamentals": f,
+        "model_score": a["score"], "crowd_score": round(crowd), "sent_score": round(ss), "live_weight": round(live_w, 2),
+        "score": round(final), "decision": dec, "agreement": agreement(a["score"], crowd, researched),
+        "reasons": {"pos": pos, "neg": neg}, "size_hint": SIZE_HINT.get(bucket, ""),
+        "verdict": f"{dec['label']}. {SIZE_HINT.get(bucket, '')}", "sentiment": s,
     }
 
 
-def verdict(u, score, m):
-    b = u["bucket"]
-    if b == "spec":
-        return "Speculative - only money you can afford to lose (max ~5%)."
-    if b == "stock":
-        return "Single company - more risk than a fund. Better as a small extra than a core holding."
-    if score >= 80:
-        return "Strong long-term core holding."
-    if score >= 70:
-        return "Good long-term option."
-    if score >= 60:
-        return "OK as a small slice alongside a core fund."
-    return "Weaker fit for a beginner long-term portfolio."
+def discovered_items(sent):
+    """Tickers people mention that the app doesn't track: they get the same data check and models."""
+    out = []
+    samples = (sent or {}).get("trending_samples", {})
+    for t, n in (sent or {}).get("trending_other", [])[:12]:
+        if n < 2 or t in BY_TICKER:
+            continue
+        out.append(dict(ticker=t, yahoo=f"{t}.AX", name=t, bucket=None, kind=None, researched=False, discovered=True,
+                        mentions=n, samples=samples.get(t, []), fee=None, holdings=None, quality=None, baseline=50,
+                        what="", community=f"Mentioned {n} times in the latest scan of Australian investing discussions.",
+                        cons="Not researched. Check what the company or fund does before buying."))
+    return out
+
+
+_ASSETS_MEMO = {}
+_ASSETS_LOCK = threading.Lock()
 
 
 def all_assets():
+    """Every investment through the models, grouped later by kind. Memoised for 10 minutes."""
     sent = load_sentiment()
-    with ThreadPoolExecutor(8) as ex:
-        assets = list(ex.map(lambda u: build_asset(u, sent), UNIVERSE))
-    return sorted(assets, key=lambda a: -a.get("score", 0))
+    key = (sent or {}).get("fetched_at")
+    with _ASSETS_LOCK:
+        hit = _ASSETS_MEMO.get(key)
+        if hit and time.time() - hit[0] < 600:
+            return hit[1]
+        bench, extras = benchmarks(), {"cg": coingecko_data()}
+        items = UNIVERSE + discovered_items(sent)
+        with ThreadPoolExecutor(8) as ex:
+            res = list(ex.map(lambda u: build_asset(u, sent, bench, extras), items))
+        out = {"assets": sorted([a for a in res if not a.get("no_data")], key=lambda a: -a["score"]),
+               "no_data": [a for a in res if a.get("no_data")],
+               "fear_greed": fear_greed(), "sentiment_at": key,
+               "risk_free": models.RISK_FREE, "horizon": models.HORIZON}
+        _ASSETS_MEMO.clear()
+        _ASSETS_MEMO[key] = (time.time(), out)
+        return out
 
 
 # --------------------------------------------------------------------------- plan
@@ -468,7 +791,7 @@ PROFILES = {
 
 
 def make_plan(amount, profile, simple, monthly):
-    assets = {a["ticker"]: a for a in all_assets() if "error" not in a}
+    assets = {a["ticker"]: a for a in all_assets()["assets"] if a.get("researched")}
     weights = dict(PROFILES.get(profile, PROFILES["balanced"]))
     if simple and profile == "growth":
         weights = {"cash": 0.10, "core": 0.90}
@@ -489,7 +812,7 @@ def make_plan(amount, profile, simple, monthly):
             continue
         lines.append({"ticker": a["ticker"], "name": a["name"], "bucket_label": a["bucket_label"],
                       "amount": amt, "weight": w, "score": a["score"], "fee": a["fee"],
-                      "why": a["what"]})
+                      "decision": a["decision"]["label"], "why": a["what"]})
     # ASX needs $500 minimum first buy - fold tiny lines into the largest share line
     share_lines = [l for l in lines if l["ticker"] != "HISA"]
     big = max(share_lines, key=lambda l: l["amount"]) if share_lines else None
@@ -502,14 +825,12 @@ def make_plan(amount, profile, simple, monthly):
     if big and big["amount"] < 500:
         notes.append("Under $500 can't buy an ASX ETF yet - keep saving in the HISA until you hit $500.")
 
-    # expected returns (conservative) for projection
+    # expected returns for the projection: the models' growth after volatility drag, capped to stay conservative
     def exp_ret(l):
         if l["ticker"] == "HISA":
             return HISA_RATE, 0.0
-        a = assets[l["ticker"]]
-        m = a["metrics"]
-        hist = m.get("cagr10") or m.get("cagr5") or m.get("cagr_all") or 0.07
-        return min(hist, 0.085) * 0.9, m.get("vol") or 0.15   # haircut: past != future
+        e = assets[l["ticker"]]["model"]["expected"]
+        return min(e["growth"], 0.085), e["vol"]
     er = sum(l["weight"] * exp_ret(l)[0] for l in lines)
     vol = sum(l["weight"] * exp_ret(l)[1] for l in lines)
 
@@ -517,8 +838,7 @@ def make_plan(amount, profile, simple, monthly):
     series = {}
     for l in lines:
         if l["ticker"] != "HISA":
-            m = yahoo_chart(assets[l["ticker"]]["yahoo"], "10y", "1mo")
-            series[l["ticker"]] = m
+            series[l["ticker"]] = yahoo_chart(assets[l["ticker"]]["yahoo"], "10y", "1mo")
     back = backtest(lines, series, amount, monthly, months=60)
     return {"lines": lines, "notes": notes, "exp_return": er, "exp_vol": vol, "backtest": back,
             "hisa_rate": HISA_RATE}
@@ -560,10 +880,9 @@ def resolve(q):
     up = q.upper().replace(".AX", "")
     if up in BY_TICKER:
         return BY_TICKER[up]["yahoo"], BY_TICKER[up]
-    if up in ("BITCOIN",):
-        return "BTC-AUD", BY_TICKER["BTC"]
-    if up in ("ETHEREUM",):
-        return "ETH-AUD", BY_TICKER["ETH"]
+    for u in UNIVERSE:
+        if up.lower() in ALIASES.get(u["ticker"], []) or up.lower() == u["name"].lower():
+            return u["yahoo"], u
     if re.fullmatch(r"[A-Z0-9]{3,5}", up):
         for sym in (up + ".AX", up, up + "-AUD"):
             try:
@@ -584,14 +903,13 @@ def resolve(q):
     return None, None
 
 
-def classify_unknown(chart, met):
+def classify_unknown(chart):
     typ = (chart.get("type") or "").upper()
     if typ == "CRYPTOCURRENCY":
-        return "spec"
+        return "spec", "crypto"
     if typ == "ETF":
-        return "satellite"
-    vol = met.get("vol") or 0
-    return "spec" if vol > 0.55 else "stock"
+        return "satellite", "etf"
+    return "stock", "stock"
 
 
 def news_for(q):
@@ -607,6 +925,7 @@ def news_for(q):
 
 def check_portfolio(items):
     sent = load_sentiment() or {}
+    bench, extras = benchmarks(), {"cg": coingecko_data()}
     rows, errors = [], []
     for it in items:
         sym, known = resolve(it["ticker"])
@@ -618,30 +937,24 @@ def check_portfolio(items):
         except Exception:
             errors.append(f"No price data for '{it['ticker']}'.")
             continue
-        met = metrics(chart)
         if known:
-            a = build_asset(known, sent)
-            bucket, fee, quality, name = known["bucket"], known["fee"], known["quality"], known["name"]
-            s = a.get("sentiment"); sscore = a.get("sent_score"); score = a.get("score")
-            community = known["community"]; cons = known["cons"]
+            u = known
         else:
-            bucket = classify_unknown(chart, met)
-            fee = None
-            quality = {"spec": 30, "stock": 55, "satellite": 55}[bucket]
-            name = chart["name"]
-            nitems = news_for(chart["name"] if len(chart["name"]) < 40 else sym.split(".")[0])
-            s = summarise([], nitems)
-            fake = {"baseline": 50}
-            sscore, _ = sentiment_score(fake, s)
-            ps = perf_score(met)
-            score = 0.4 * quality + 0.3 * ps + 0.3 * sscore
-            score = min(score, 35 if bucket == "spec" else 60)
-            community = "Not in the app's researched list - sentiment below is from recent news headlines only."
-            cons = ""
-        rows.append({"input": it["ticker"], "symbol": sym, "name": name, "amount": it["amount"],
-                     "bucket": bucket, "bucket_label": BUCKET_LABEL[bucket], "fee": fee, "quality": quality,
-                     "metrics": met, "score": round(score or 0), "sent_score": round(sscore or 50),
-                     "sentiment": s, "community": community, "cons": cons,
+            bucket, kind = classify_unknown(chart)
+            u = dict(ticker=it["ticker"].upper(), yahoo=sym, name=chart["name"], bucket=bucket, kind=kind,
+                     researched=False, discovered=True, fee=None, holdings=None, quality=None, baseline=50, what="",
+                     community="Not in the app's researched list - sentiment below is from recent news headlines only.",
+                     cons="")
+            u["_sent"] = summarise([], news_for(chart["name"] if len(chart["name"]) < 40 else sym.split(".")[0]))
+        a = build_asset(u, sent, bench, extras)
+        if a.get("no_data"):
+            errors.append(f"{it['ticker']}: {a['reason']} It isn't scored.")
+            continue
+        rows.append({"input": it["ticker"], "symbol": sym, "name": a["name"], "amount": it["amount"],
+                     "bucket": a["bucket"], "bucket_label": a["bucket_label"], "fee": a.get("fee"),
+                     "quality": a.get("quality"), "metrics": a["metrics"], "score": a["score"],
+                     "sent_score": a["sent_score"], "decision": a["decision"], "sentiment": a["sentiment"],
+                     "community": a["community"], "cons": a["cons"], "vol": a["model"]["expected"]["vol"],
                      "spark": chart["adj"][-60:]})
     total = sum(r["amount"] for r in rows)
     if not total:
@@ -660,7 +973,7 @@ def check_portfolio(items):
     fees = [(r["weight"], r["fee"]) for r in rows
             if r["fee"] is not None and r["bucket"] not in ("stock", "spec")]
     avg_fee = sum(a * b for a, b in fees) / sum(a for a, _ in fees) if fees else None
-    vols = [(r["weight"], r["metrics"].get("vol")) for r in rows if r["metrics"].get("vol")]
+    vols = [(r["weight"], r["vol"]) for r in rows if r.get("vol")]
     port_vol = sum(a * b for a, b in vols) / sum(a for a, _ in vols) if vols else None
 
     points = 100
@@ -690,7 +1003,7 @@ def check_portfolio(items):
     tick = {r["symbol"].split(".")[0].split("-")[0] for r in rows}
     overlaps = [("DHHF", "VAS"), ("DHHF", "VGS"), ("VDHG", "VAS"), ("VDHG", "VGS"), ("DHHF", "VDHG"),
                 ("VAS", "A200"), ("VAS", "IOZ"), ("A200", "IOZ"), ("IVV", "NDQ"), ("VGS", "BGBL"),
-                ("VGS", "IWLD"), ("VAS", "CBA"), ("VAS", "BHP")]
+                ("VGS", "IWLD"), ("VAS", "CBA"), ("VAS", "BHP"), ("IVV", "VTS"), ("VGS", "VTS")]
     for a, b in overlaps:
         if a in tick and b in tick:
             points -= 3
@@ -700,9 +1013,9 @@ def check_portfolio(items):
         flags.append(f"{len(rows)} holdings is a lot for this size - more brokerage, harder to track, rarely better.")
     if port_vol and port_vol > 0.3:
         flags.append(f"Expect big swings - weighted volatility is ~{port_vol:.0%}/yr (a broad ETF is ~12-16%).")
-    weak = [r for r in rows if r["score"] < 45]
-    for r in weak:
-        flags.append(f"{r['input']} scores low ({r['score']}/100) on the app's long-term model.")
+    for r in rows:
+        if r["decision"]["tone"] in ("wait", "avoid"):
+            flags.append(f"{r['input']}: the models say \"{r['decision']['label']}\" ({r['score']}/100).")
     points = max(0, min(100, points))
     grade = "A" if points >= 85 else "B" if points >= 72 else "C" if points >= 58 else "D" if points >= 42 else "F"
     return {"rows": rows, "errors": errors, "total": total, "grade": grade, "points": round(points),
@@ -868,7 +1181,7 @@ class Handler(SimpleHTTPRequestHandler):
         q = dict(urllib.parse.parse_qsl(p.query))
         try:
             if p.path == "/api/assets":
-                return self.send_json({"assets": all_assets(), "sentiment_at": (load_sentiment() or {}).get("fetched_at")})
+                return self.send_json(all_assets())
             if p.path == "/api/research":
                 return self.send_json(RESEARCH)
             if p.path == "/api/sentiment":

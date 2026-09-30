@@ -13,6 +13,11 @@ bucket:
   satellite - themed / concentrated, fine as a small slice
   stock     - a single company (more risk than a fund)
   spec      - speculative (crypto etc.) - small "fun money" only
+
+kind (what the models treat it as) is worked out from the bucket: stock, crypto (spec) or etf (the rest).
+researched=False marks entries added after the Sept 2026 research: they have no researched community view,
+so their decision leans on the models and the live scan only (baseline 50 = no opinion).
+stocktwits / coingecko: ids on those sites, where the investment is covered there.
 """
 
 UNIVERSE = [
@@ -121,6 +126,17 @@ UNIVERSE = [
          community="Hot recent theme in AU media. Momentum-driven.",
          cons="Narrow, high fee, bought mostly on recent hype."),
 
+    dict(ticker="VTS", yahoo="VTS.AX", name="Vanguard US Total Market Shares", bucket="global", researched=False,
+         fee=0.03, holdings=3500, quality=84, baseline=50,
+         what="The whole US share market (~3,500 companies, large to small) at a tiny fee.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="US only. Its US listing means a US tax form (W-8BEN) and US estate-tax rules."),
+    dict(ticker="QUAL", yahoo="QUAL.AX", name="VanEck MSCI World ex-Australia Quality", bucket="satellite", researched=False,
+         fee=0.40, holdings=300, quality=70, baseline=50,
+         what="About 300 global companies picked for high profits, steady earnings and low debt.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Higher fee than a plain global index and heavy in large US tech."),
+
     # ---- single companies (examples people ask about) -------------------------------
     dict(ticker="CBA", yahoo="CBA.AX", name="Commonwealth Bank", bucket="stock",
          fee=0.0, holdings=1, quality=58, baseline=40,
@@ -128,7 +144,7 @@ UNIVERSE = [
          community="Great business, but analysts and forums widely call it overvalued - "
                    "only ~8% of analysts rate it a buy and its P/E has been higher than Alphabet's.",
          cons="Single company, expensive vs earnings growth of ~2-3%. Already ~10% of VAS anyway."),
-    dict(ticker="BHP", yahoo="BHP.AX", name="BHP Group", bucket="stock",
+    dict(ticker="BHP", yahoo="BHP.AX", name="BHP Group", bucket="stock", stocktwits="BHP",
          fee=0.0, holdings=1, quality=58, baseline=58,
          what="World's biggest miner (iron ore, copper).",
          community="Seen as a solid dividend payer, but tied to China and commodity cycles.",
@@ -144,19 +160,86 @@ UNIVERSE = [
          community="Viewed as a quality long-term compounder; often 'fully priced'.",
          cons="Single company risk; tied to Australian consumer spending."),
 
+
+    # ---- more companies people discuss (added after the research: no researched view) ---
+    dict(ticker="MQG", yahoo="MQG.AX", name="Macquarie Group", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Global investment bank and asset manager, Australia's largest.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; profits swing with markets and deal-making."),
+    dict(ticker="RIO", yahoo="RIO.AX", name="Rio Tinto", bucket="stock", stocktwits="RIO", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Global miner: iron ore, aluminium and copper.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; tied to commodity prices and China."),
+    dict(ticker="NAB", yahoo="NAB.AX", name="National Australia Bank", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="One of the big four banks and the largest business lender.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; already a big part of VAS."),
+    dict(ticker="WBC", yahoo="WBC.AX", name="Westpac", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Big four bank with a large home-loan book.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; sensitive to the housing market and interest rates."),
+    dict(ticker="FMG", yahoo="FMG.AX", name="Fortescue", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Iron ore miner that is also investing in green energy.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; very dependent on the iron ore price."),
+    dict(ticker="WDS", yahoo="WDS.AX", name="Woodside Energy", bucket="stock", stocktwits="WDS", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Australia's largest oil and gas producer.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; swings with oil and gas prices."),
+    dict(ticker="TLS", yahoo="TLS.AX", name="Telstra", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Australia's largest telco: mobile and internet.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; slow growth, valued mostly for its dividend."),
+    dict(ticker="XRO", yahoo="XRO.AX", name="Xero", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Cloud accounting software for small businesses.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; priced for strong growth, so it can fall hard on bad news."),
+    dict(ticker="WTC", yahoo="WTC.AX", name="WiseTech Global", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Logistics software (CargoWise) used by freight companies.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; expensive and has had governance controversy."),
+    dict(ticker="GMG", yahoo="GMG.AX", name="Goodman Group", bucket="stock", researched=False,
+         fee=0.0, holdings=1, quality=55, baseline=50,
+         what="Industrial property: warehouses and data centres.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Single company; sensitive to interest rates and property values."),
     # ---- speculative ------------------------------------------------------------------
-    dict(ticker="BTC", yahoo="BTC-AUD", name="Bitcoin", bucket="spec",
+    dict(ticker="BTC", yahoo="BTC-AUD", name="Bitcoin", bucket="spec", stocktwits="BTC.X", coingecko="bitcoin",
          fee=0.0, holdings=1, quality=30, baseline=45,
          what="The largest cryptocurrency.",
          community="Divisive. Believers post big gains; the RBA has publicly warned Australians about "
                    "speculating on crypto. FI forums: fine as <5% 'fun money' only.",
          cons="Can fall 50-80%. No earnings or dividends. Scams are common around crypto."),
-    dict(ticker="ETH", yahoo="ETH-AUD", name="Ethereum", bucket="spec",
+    dict(ticker="ETH", yahoo="ETH-AUD", name="Ethereum", bucket="spec", stocktwits="ETH.X", coingecko="ethereum",
          fee=0.0, holdings=1, quality=26, baseline=40,
          what="Second-largest cryptocurrency.",
          community="Same debate as Bitcoin, with even bigger swings.",
          cons="Extremely volatile; speculative."),
+    dict(ticker="SOL", yahoo="SOL-AUD", name="Solana", bucket="spec", stocktwits="SOL.X", coingecko="solana", researched=False,
+         fee=0.0, holdings=1, quality=22, baseline=50,
+         what="A fast blockchain and a top-10 cryptocurrency.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Extremely volatile; the network has had outages. Speculative."),
+    dict(ticker="XRP", yahoo="XRP-AUD", name="XRP", bucket="spec", stocktwits="XRP.X", coingecko="ripple", researched=False,
+         fee=0.0, holdings=1, quality=22, baseline=50,
+         what="A cryptocurrency aimed at fast international payments, linked to the company Ripple.",
+         community="Not part of the original research. What people say comes from the live scan only.",
+         cons="Extremely volatile and heavily driven by hype and legal news. Speculative."),
 ]
+
+for u in UNIVERSE:
+    u.setdefault("researched", True)
+    u["kind"] = "stock" if u["bucket"] == "stock" else "crypto" if u["bucket"] == "spec" else "etf"
+
 
 BY_TICKER = {u["ticker"]: u for u in UNIVERSE}
 
@@ -169,6 +252,18 @@ ALIASES = {
     "CSL": ["csl"],
     "WES": ["wesfarmers"],
     "GOLD": ["gold etf"],
+    "MQG": ["macquarie group", "macquarie"],
+    "RIO": ["rio tinto"],
+    "NAB": ["national australia bank"],
+    "WBC": ["westpac"],
+    "FMG": ["fortescue"],
+    "WDS": ["woodside"],
+    "TLS": ["telstra"],
+    "XRO": ["xero"],
+    "WTC": ["wisetech"],
+    "GMG": ["goodman group"],
+    "SOL": ["solana"],
+    "XRP": ["xrp", "ripple"],
 }
 
 BUCKET_LABEL = {
@@ -178,8 +273,10 @@ BUCKET_LABEL = {
     "defensive": "Defensive (bonds/cash)",
     "satellite": "Themed / satellite",
     "stock": "Single company",
-    "spec": "Speculative",
+    "spec": "Crypto",
+    "found": "Found in online discussions",
 }
+KIND_LABEL = {"etf": "ETFs & funds", "stock": "Stocks", "crypto": "Crypto"}
 
 # Conclusions from the Sept 2026 web research - shown in the app and used as the baseline
 RESEARCH = {
